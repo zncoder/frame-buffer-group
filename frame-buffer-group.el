@@ -76,6 +76,7 @@ where they are opened."
 	"List of groups this buffer is in")
 
 (setq	fbg/all-group-names nil
+			fbg/groups-restored nil
 			fbg/timer nil)
 
 (unless (fboundp 'fbg/builtin-buffer-list)
@@ -84,7 +85,8 @@ where they are opened."
 (defun frame-buffer-group-set-name (name)
 	"Set group of this frame to NAME."
 	(interactive
-	 (list (completing-read "Group name (empty to remove): " fbg/all-group-names)))
+	 (list (completing-read "Group name (empty to remove): "
+													(progn (fbg/restore-groups) fbg/all-group-names))))
 	(if (eq 0 (length name))
 			(fbg/remove-name)
 		(let ((oldname (fbg/frame-group)))
@@ -182,30 +184,22 @@ where they are opened."
 			lst
 		(cons elt lst)))
 
-(defun fbg/start-restore ()
-	(if (and (boundp 'desktop-lazy-timer) desktop-lazy-timer)
-			;; wait for desktop lazy load to finish
-			(run-with-idle-timer 5 nil 'fbg/start-restore)
-		(fbg/restore)))
-
-(defun fbg/restore ()
-	(let ((bufs (fbg/builtin-buffer-list))
-				(frames (frame-list))
-				(allnames (make-hash-table :test 'equal))
-				names)
-		;; restore groups
-		(dolist (b bufs)
-			(with-current-buffer b
-				(dolist (name frame-buffer-group-groups-buffer-in)
-					(puthash name t allnames))))
-		(maphash (lambda (k v) (setq names (cons k names))) allnames)
-		(setq fbg/all-group-names names)
-		;; add buffers to frames
-		(dolist (frame frames)
-			(let ((name (fbg/frame-group frame)))
-				(when name
-					(fbg/attach-buffers-to-frame frame name bufs)))))
-	(message "FrameBufferGroup restored"))
+(defun fbg/restore-groups ()
+	(and (boundp 'desktop-lazy-timer) desktop-lazy-timer
+			 (error "desktop is being restored"))
+	(unless fbg/groups-restored
+		(let ((bufs (fbg/builtin-buffer-list))
+					(allnames (make-hash-table :test 'equal))
+					names)
+			;; restore groups
+			(dolist (b bufs)
+				(with-current-buffer b
+					(dolist (name frame-buffer-group-groups-buffer-in)
+						(puthash name t allnames))))
+			(maphash (lambda (k v) (setq names (cons k names))) allnames)
+			(setq fbg/all-group-names names))
+		(message "groups:%s restored" fbg/all-group-names)
+		(setq fbg/groups-restored t)))
 
 (defun fbg/attach-buffers-to-frame (frame name &optional allbufs)
 	;; add buffers in group to frame
@@ -220,6 +214,7 @@ where they are opened."
 (defun frame-buffer-group-remove-current-buffer ()
 	"Remove current buffer from this group."
   (interactive)
+	(fbg/restore-groups)
 	(let* ((frame (selected-frame))
 				 (name (fbg/frame-group frame))
 				 (buf (current-buffer))
@@ -241,6 +236,7 @@ where they are opened."
 
 (defun frame-buffer-group-add-buffers-from-buffer-menu ()
   (interactive)
+	(fbg/restore-groups)
   (let* ((newbufs (Buffer-menu-marked-buffers))
 				 (frame (selected-frame))
 				 (name (fbg/frame-group frame))
@@ -299,8 +295,6 @@ where they are opened."
 						 (not (memq 'frame-buffer-group-groups-buffer-in desktop-locals-to-save)))
 		(customize-set-variable 'desktop-locals-to-save
 														(cons 'frame-buffer-group-groups-buffer-in desktop-locals-to-save)))
-	(when (boundp 'desktop-after-read-hook)
-		(add-hook 'desktop-after-read-hook 'fbg/start-restore))
 	(setq fbg/timer
 				(run-with-idle-timer 29 t 'fbg/ensure-buffers-in-group))
 	;; use builtin for some functions
@@ -322,8 +316,6 @@ where they are opened."
 		(customize-set-variable 'desktop-locals-to-save
 														(seq-remove (lambda (x) (eq x 'frame-buffer-group-groups-buffer-in))
 																				desktop-locals-to-save)))
-	(when (boundp 'desktop-after-read-hook)
-		(remove-hook 'desktop-after-read-hook 'fbg/restore))
 	(dolist (func '(desktop-save))
 		(when (fboundp func)
 			(advice-remove func 'fbg/apply-with-builtin-buffer-list))))
