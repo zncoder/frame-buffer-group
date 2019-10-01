@@ -198,6 +198,10 @@ where they are opened."
 						(puthash name t allnames))))
 			(maphash (lambda (k v) (setq names (cons k names))) allnames)
 			(setq fbg/all-group-names names))
+		(add-hook 'focus-in-hook 'fbg/merge-buffers)
+		(add-hook 'focus-out-hook 'fbg/ensure-state)
+		(setq fbg/timer
+					(run-with-idle-timer 29 t 'fbg/ensure-buffers-in-group))
 		(message "groups:%s restored" fbg/all-group-names)
 		(setq fbg/groups-restored t)))
 
@@ -289,14 +293,10 @@ where they are opened."
 	(message "fbg/enable")
 	(advice-add 'buffer-list :override 'fbg/buffer-list)
 	(add-hook 'after-make-frame-functions 'fbg/after-make-frame)
-	(add-hook 'focus-in-hook 'fbg/merge-buffers)
-	(add-hook 'focus-out-hook 'fbg/ensure-state)
 	(when (and (boundp 'desktop-locals-to-save)
 						 (not (memq 'frame-buffer-group-groups-buffer-in desktop-locals-to-save)))
 		(customize-set-variable 'desktop-locals-to-save
 														(cons 'frame-buffer-group-groups-buffer-in desktop-locals-to-save)))
-	(setq fbg/timer
-				(run-with-idle-timer 29 t 'fbg/ensure-buffers-in-group))
 	;; use builtin for some functions
 	(dolist (func '(desktop-save))
 		(when (fboundp func)
