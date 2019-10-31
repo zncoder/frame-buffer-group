@@ -253,6 +253,11 @@ where they are opened."
   (interactive)
   (fbg/call-interactively-with-builtin-buffer-list 'switch-to-buffer))
 
+(defun frame-buffer-group-list-buffers ()
+	(interactive)
+	(let ((bufs (frame-parameter nil 'buffer-list)))
+		(display-buffer (list-buffers-noselect nil bufs))))
+
 (defun fbg/after-make-frame (frame)
 	;; don't put current buffer in the new frame
 	(let ((w (car (window-list frame))))
