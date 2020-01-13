@@ -298,10 +298,6 @@ where they are opened."
 	(message "fbg/enable")
 	(advice-add 'buffer-list :override 'fbg/buffer-list)
 	(add-hook 'after-make-frame-functions 'fbg/after-make-frame)
-	(when (and (boundp 'desktop-locals-to-save)
-						 (not (memq 'frame-buffer-group-groups-buffer-in desktop-locals-to-save)))
-		(customize-set-variable 'desktop-locals-to-save
-														(cons 'frame-buffer-group-groups-buffer-in desktop-locals-to-save)))
 	;; use builtin for some functions
 	(dolist (func '(desktop-save))
 		(when (fboundp func)
@@ -324,6 +320,8 @@ where they are opened."
 	(dolist (func '(desktop-save))
 		(when (fboundp func)
 			(advice-remove func 'fbg/apply-with-builtin-buffer-list))))
+
+(customize-push-and-save 'desktop-locals-to-save '(frame-buffer-group-groups-buffer-in))
 
 (provide 'frame-buffer-group)
 ;;; frame-buffer-group.el ends here
