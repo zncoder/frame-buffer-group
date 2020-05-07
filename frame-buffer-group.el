@@ -21,29 +21,46 @@
 
 ;;; Commentary:
 
-;; FrameBufferGroup provides a simple way to organize buffers around
-;; frames. Buffers that are opened in a frame stay with the frame and
-;; are not visible in other frames (not shown in
-;; switch-to-buffer). They form a buffer group. A new frame starts in
-;; an anonymous group. You can set a name to the group. Named group
-;; can be attached to multiple frames in case you need multiple frames
-;; to work with these buffers. Named groups can also be saved in emacs
-;; desktop.
+;; FrameBufferGroup provides a straightforward way to organize buffers
+;; around frames. Buffers are placed in groups, and a frame can be
+;; bound to a group. The buffers in a group are visible (shown in
+;; switch-to-buffer) in this frame, but are not visible in another
+;; frame that are not bound to the group. The relationship between
+;; buffer, group, and frame is,
+;; - a buffer can be in N groups
+;; - a group can have N buffers
+;; - a frame is bound to 1 group
+;; - a group can be bound to N frames
+;; For example,
+;; - B1 -> (G1, G2)
+;; - B2 -> (G1)
+;; - B3 -> (G1)
+;; - F1 -> G1
+;; - F2 -> G2
+;; - F3 -> G1
+;; In this example, buffer B1, B2 and B3 are visible in frame F1 and F3, and B1 is visible in F2.
+;;
+;; The default group is the unnamed group, "*", which every newly created
+;; frame is bound to. The command frame-buffer-group-bind-group binds
+;; the frame to a group, a named one or the unnamed one. If the group
+;; does not exist, it is created. If the current group is the unnamed
+;; group, the buffers that are visible when the command is called are
+;; placed in the group. After a frame is bound to a group, all buffers
+;; in the group are visible in the frame.
 ;;
 ;; A typical workflow is,
+;; - create a new frame (this frame is bound to the unnamed group)
+;; - bind the frame to a new group foo
+;; - work in the frame
+;; - buffers opened in the frame are visible
+;; - need another frame to work on the same thing
+;; - create a new frame
+;; - bind the frame to the group foo
 ;; - to work on something new, create a new frame
-;; - open buffers in this frame and work on them
-;; - set a name to make this group survive emacs restarts or when you
-;;   need anothe frame to work on these buffers
-;; - create a new frame (during this emacs session or after emacs
-;;   restart), and set a name to the same group to attach the group to it
 ;;
-;; A buffer can be in multiple groups. When you switch to a buffer in
-;; another frame, the buffer is added to the group of the other
-;; frame. You can remove the current buffer from the group. To visit a
-;; buffer in another group, you can call
-;; frame-buffer-group-switch-to-buffer, which shows all buffers, not
-;; just the buffers in this group.
+;; The buffer local variable frame-buffer-group-groups has all groups
+;; the buffer is in. It is added to desktop-locals-to-save to persist
+;; the group info.
 
 ;;; Installation:
 
@@ -51,277 +68,242 @@
 ;;
 ;;    (require 'frame-buffer-group)
 ;;    (frame-buffer-group-mode 1)
-;;
-;; To save buffer groups in emacs desktop, customize
-;; desktop-locals-to-save to include frame-buffer-group-groups-buffer-in.
 
 ;;; Code:
 
-(defvar frame-buffer-group-mode nil)
-
 (defun frame-buffer-group-mode (arg)
-	"Toggle focused frame mode.
+	"Toggle frame buffer group mode.
 Positive ARG enables the mode. Zero or negative ARG disable the
 mode.  When the mode is on, buffers are associated with the frame
 where they are opened."
 	(interactive "P")
-	(setq frame-buffer-group-mode
-				(if arg (> (prefix-numeric-value arg) 0)
-					(not frame-buffer-group-mode)))
-	(if frame-buffer-group-mode
-			(fbg/enable)
-		(fbg/disable)))
+	(let ((old fbg/enabled)
+				(new (> (prefix-numeric-value arg) 0)))
+		(unless (eq old new)
+			(if new
+					(fbg/enable)
+				(fbg/disable))
+			(setq fbg/enabled new))))
 
-(defvar-local frame-buffer-group-groups-buffer-in nil
-	"List of groups this buffer is in")
-
-(setq	fbg/all-group-names nil
-			fbg/groups-restored nil
-			fbg/timer nil)
-
-(unless (fboundp 'fbg/builtin-buffer-list)
-	(fset 'fbg/builtin-buffer-list (symbol-function 'buffer-list)))
-
-(defun frame-buffer-group-set-name (name)
-	"Set group of this frame to NAME."
-	(interactive
-	 (list (completing-read "Group name (empty to remove): "
-													(progn (fbg/restore-groups) fbg/all-group-names))))
-	(if (eq 0 (length name))
-			(fbg/remove-name)
-		(let ((oldname (fbg/frame-group)))
-			(unless (equal oldname name)
-				(when (> (length oldname) 0)
-					(fbg/remove-name))
-				(fbg/add-name name)))))
-
-(defun fbg/add-name (name)
-	(let* ((frame (selected-frame))
-				 (bufs (frame-parameter frame 'buffer-list))
-				 (otherframes (fbg/frames-in-group name))
-				 (otherbufs (frame-parameter (car otherframes) 'buffer-list)))
-		(setq fbg/all-group-names (fbg/add-to-list name fbg/all-group-names))
-		(fbg/set-frame-group frame name)
-		(if (eq 1 (length (fbg/frames-in-group name)))
-				;; some buffers may already in this group and
-				;; this is the first frame in the group
-				(fbg/attach-buffers-to-frame frame name)
-			(fbg/merge-buffers name))))
-
-(defun fbg/remove-name ()
-	(let* ((frame (selected-frame))
-				 (name (fbg/frame-group frame)))
-		(when (> (length name) 0)
-			(fbg/set-frame-group frame nil)			;remove
-			(unless (fbg/frames-in-group name)
-				;; no other frames in this group,
-				;; remove buffers from the group and the group itself
-				(fbg/update-groups-buffer-in frame name t)
-				(setq fbg/all-group-names (delete name fbg/all-group-names))))))
-
-;; ensure all buffers in this frame are in the group
-(defun fbg/ensure-buffers-in-group (&optional frame)
-	(let* ((frame (or frame (selected-frame)))
-				 (name (fbg/frame-group frame)))
-		(fbg/update-groups-buffer-in frame name)))
-
-;; ensure all buffers are in the correct groups and frames.
-;; for each group, get the list of frames and make sure
-;; buffers of these frames are in the group.
-(defun fbg/ensure-state ()
-	(dolist (name fbg/all-group-names)
-		(let ((frames (fbg/frames-in-group name)))
-			(when frames
-				(fbg/ensure-buffers-in-group (car frames))))))
-
-(defun fbg/update-groups-buffer-in (frame name &optional remove)
-	(when name
-		(dolist (b (frame-parameter frame 'buffer-list))
-			(with-current-buffer b
-				(if remove
-						(fbg/remove-buffer-from-group name)
-					(fbg/add-buffer-to-group name))))))
-
-(defun fbg/remove-buffer-from-group (name)
-	(setq frame-buffer-group-groups-buffer-in
-				(delete name frame-buffer-group-groups-buffer-in)))
-
-(defun fbg/add-buffer-to-group (name)
-	(setq frame-buffer-group-groups-buffer-in
-				(fbg/add-to-list name frame-buffer-group-groups-buffer-in)))
-
-;; ensure all buffers in all frames of the same group are in every frame
-(defun fbg/merge-buffers (&optional name)
-	(let* ((name (or name (fbg/frame-group)))
-				 (frames (fbg/frames-in-group name))
-				 (allbufs (make-hash-table :test 'eq)))
-		(dolist (frame frames)
-			(dolist (b (frame-parameter frame 'buffer-list))
-				(puthash b t allbufs)
-				(with-current-buffer b
-					(let ((bufname (buffer-name)))
-						(unless (or (string-prefix-p " " bufname) (string-prefix-p "*" bufname))
-							(fbg/add-buffer-to-group name))))))
-		(let ((n (hash-table-count allbufs))
-					bufs)
-			(maphash (lambda (b v) (setq bufs (cons b bufs))) allbufs)
-			(dolist (frame frames)
-				(unless (eq n (length (frame-parameter frame 'buffer-list)))
-					(fbg/reset-frame-buffer-list frame bufs))))))
-
-(defun fbg/frame-group (&optional frame)
-	(when (frame-parameter frame 'frame-buffer-group-p)
-		(frame-parameter frame 'title)))
-
-(defun fbg/set-frame-group (frame name)
-	(modify-frame-parameters
-	 frame
-	 `((title . ,name)
-		 (frame-buffer-group-p . ,(and name t)))))
-
-(defun fbg/add-to-list (elt lst)
-	(if (member elt lst)
-			lst
-		(cons elt lst)))
-
-(defun fbg/restore-groups ()
-	(and (boundp 'desktop-lazy-timer) desktop-lazy-timer
-			 (error "desktop is being restored"))
-	(unless fbg/groups-restored
-		(let ((bufs (fbg/builtin-buffer-list))
-					(allnames (make-hash-table :test 'equal))
-					names)
-			;; restore groups
-			(dolist (b bufs)
-				(with-current-buffer b
-					(dolist (name frame-buffer-group-groups-buffer-in)
-						(puthash name t allnames))))
-			(maphash (lambda (k v) (setq names (cons k names))) allnames)
-			(setq fbg/all-group-names names))
-		(add-hook 'focus-in-hook 'fbg/merge-buffers)
-		(add-hook 'focus-out-hook 'fbg/ensure-state)
-		(setq fbg/timer
-					(run-with-idle-timer 29 t 'fbg/ensure-buffers-in-group))
-		(message "groups:%s restored" fbg/all-group-names)
-		(setq fbg/groups-restored t)))
-
-(defun fbg/attach-buffers-to-frame (frame name &optional allbufs)
-	;; add buffers in group to frame
-	(let ((bufs (seq-filter
-							 (lambda (b)
-								 (with-current-buffer b
-									 (member name frame-buffer-group-groups-buffer-in)))
-							 (or allbufs (fbg/builtin-buffer-list)))))
-		(when bufs
-			(fbg/add-buffers-to-frame frame bufs))))
-
-(defun frame-buffer-group-remove-current-buffer ()
-	"Remove current buffer from this group."
-  (interactive)
-	(fbg/restore-groups)
-	(let* ((frame (selected-frame))
-				 (name (fbg/frame-group frame))
-				 (buf (current-buffer))
-				 (frames (or (fbg/frames-in-group name) (list frame))))
-		(dolist (frame frames)
-			;; make sure buf is not displayed in frame
-			(dolist (w (window-list frame))
-				(when (eq buf (window-buffer w))
-					(with-selected-window w (switch-to-buffer "*scratch*"))))
-			;; remove buf from frame
-			(fbg/reset-frame-buffer-list frame (delete buf (frame-parameter frame 'buffer-list))))
-		(fbg/remove-buffer-from-group name)))
-
-(defun fbg/frames-in-group (name)
-	(when (member name fbg/all-group-names)
-		(seq-filter
-		 (lambda (x) (equal name (fbg/frame-group x)))
-		 (frame-list))))
+(defvar-local frame-buffer-group-groups nil
+	"Groups this buffer is in")
 
 (defun frame-buffer-group-add-buffers-from-buffer-menu ()
+	"Add buffers marked in buffer list to this group"
   (interactive)
-	(fbg/restore-groups)
-  (let* ((newbufs (Buffer-menu-marked-buffers))
-				 (frame (selected-frame))
-				 (name (fbg/frame-group frame))
-				 (allframes (or (fbg/frames-in-group name) (list frame))))
-		(dolist (frame allframes)
-			(fbg/add-buffers-to-frame frame newbufs))
-		(fbg/update-groups-buffer-in frame name)))
+  (let ((bufs (Buffer-menu-marked-buffers)))
+		(setq bufs (append bufs (frame-parameter nil 'buffer-list)))
+		(set-frame-parameter nil 'buffer-list (seq-uniq bufs)))
+	(fbg/ensure-buffers-visible))
 
-(defun frame-buffer-group-switch-to-buffer ()
+(defun frame-buffer-group-builtin-switch-to-buffer ()
+	"Use builtin switch-to-buffer. All buffers are visible."
   (interactive)
   (fbg/call-interactively-with-builtin-buffer-list 'switch-to-buffer))
 
 (defun frame-buffer-group-list-buffers ()
+	"List buffers in this group."
 	(interactive)
 	(let ((bufs (frame-parameter nil 'buffer-list)))
 		(display-buffer (list-buffers-noselect nil bufs))))
 
-(defun fbg/after-make-frame (frame)
-	;; don't put current buffer in the new frame
-	(let ((w (car (window-list frame))))
-		(with-selected-window w (switch-to-buffer "*scratch*")))
-	(fbg/reset-frame-buffer-list frame nil)
-	(set-frame-parameter frame 'title nil)
-	(fbg/add-stick-buffers frame))
+(defun frame-buffer-group-bind-to (group)
+	"Bind this frame to group NAME."
+	(interactive
+	 (list (completing-read "Bind to group: " fbg/all-groups)))
+	(and (fbg/empty-string-p group) (setq group "*"))
+	(unless (equal (fbg/group) group)
+		(fbg/bind-to nil group)))
 
-(defun fbg/add-buffers-to-frame (frame newbufs)
-	(let ((bufs (frame-parameter frame 'buffer-list)))
-		(dolist (b (mapcar (lambda (x) (get-buffer x)) newbufs))
-			(setq bufs (fbg/add-to-list b bufs)))
-		(fbg/reset-frame-buffer-list frame bufs)))
+(defun frame-buffer-group-remove-current-buffer ()
+	"Move current buffer from this group to the unnamed group."
+  (interactive)
+	(let* ((group (fbg/group))
+				 (frames (fbg/frames-of-group group))
+				 (buf (current-buffer))
+				 (pred (lambda (w) (eq buf (window-buffer w)))))
+		(and (equal group "*") (error "cannot remove from unnamed group"))
+		(fbg/remove-buffer-from-group group)
+		(fbg/add-buffer-to-group "*")	
+		(dolist (frame frames)
+			(fbg/switch-to-scratch frame pred))
+		(dolist (frame frames)
+			(set-frame-parameter frame 'buffer-list (delete buf (frame-parameter frame 'buffer-list))))) )
 
-(defun fbg/reset-frame-buffer-list (frame bufs)
-	(set-frame-parameter frame 'buffer-list bufs))
+;; (defun frame-buffer-group-merge-to (group))?
 
-(defun fbg/add-stick-buffers (frame)
-	(fbg/add-buffers-to-frame frame '("*scratch*" "*Messages*")))
+(unless (fboundp 'fbg/builtin-buffer-list)
+	(fset 'fbg/builtin-buffer-list (symbol-function 'buffer-list)))
 
-(defun fbg/buffer-list (&optional frame)
-	(if (or (not frame-buffer-group-mode)
-					(eq major-mode 'Buffer-menu-mode))
-      (fbg/builtin-buffer-list frame)
-    (frame-parameter frame 'buffer-list)))
-
-(defun fbg/call-interactively-with-builtin-buffer-list (cmd)
-  (cl-letf (((symbol-function 'buffer-list)
-             #'fbg/builtin-buffer-list))
-    (call-interactively cmd)))
-
-(defun fbg/apply-with-builtin-buffer-list (func &rest args)
-  (cl-letf (((symbol-function 'buffer-list)
-             #'fbg/builtin-buffer-list))
-    (apply func args)))
+(setq fbg/enabled nil
+			fbg/all-groups nil)
 
 (defun fbg/enable ()
-	(message "fbg/enable")
+	(fbg/restore-groups)
 	(advice-add 'buffer-list :override 'fbg/buffer-list)
-	(add-hook 'after-make-frame-functions 'fbg/after-make-frame)
-	;; use builtin for some functions
-	(dolist (func '(desktop-save))
+	(dolist (func fbg/builtin-function-whitelist) 
 		(when (fboundp func)
-			(advice-add func :around 'fbg/apply-with-builtin-buffer-list))))
+			(advice-add func :around 'fbg/apply-with-builtin-buffer-list)))
+	(add-hook 'after-make-frame-functions 'fbg/after-make-frame)
+	;; A group may be bounded with multiple frames. A buffer that is
+	;; newly opened in one frame should be visible in all these frames.
+	;; We add this buffer to all these frames when one of them gains
+	;; focus or the frame where the buffer is opened is deleted.
+	(add-hook 'focus-in-hook 'fbg/ensure-buffers-visible)
+	(add-hook 'delete-frame-functions 'fbg/ensure-buffers-visible)
+	(customize-push-and-save 'desktop-locals-to-save '(frame-buffer-group-groups)))
 
 (defun fbg/disable ()
-	(message "fbg/disable")
-	(advice-remove 'buffer-list 'fbg/buffer-list)
-	(when fbg/timer
-		(cancel-timer fbg/timer)
-		(setq fbg/timer nil))
+	;; keep frame-buffer-group-groups in desktop-locals-to-save
+	(remove-hook 'delete-frame-functions 'fbg/ensure-buffers-visible)
+	(remove-hook 'focus-in-hook 'fbg/ensure-buffers-visible)
 	(remove-hook 'after-make-frame-functions 'fbg/after-make-frame)
-	(remove-hook 'focus-in-hook 'fbg/merge-buffers)
-	(remove-hook 'focus-out-hook 'fbg/ensure-state)
-	(when (and (boundp 'desktop-locals-to-save)
-						 (memq 'frame-buffer-group-groups-buffer-in desktop-locals-to-save))
-		(customize-set-variable 'desktop-locals-to-save
-														(seq-remove (lambda (x) (eq x 'frame-buffer-group-groups-buffer-in))
-																				desktop-locals-to-save)))
-	(dolist (func '(desktop-save))
+	(dolist (func fbg/builtin-function-whitelist)
 		(when (fboundp func)
-			(advice-remove func 'fbg/apply-with-builtin-buffer-list))))
+			(advice-remove func 'fbg/apply-with-builtin-buffer-list)))
+	(advice-remove 'buffer-list 'fbg/buffer-list))
 
-(customize-push-and-save 'desktop-locals-to-save '(frame-buffer-group-groups-buffer-in))
+(defun fbg/buffer-managed-p (b)
+	(let ((name (buffer-name b)))
+		(and (not (string-prefix-p "*" name)) (not (string-prefix-p " " name)))))
+
+(defun fbg/restore-groups ()
+	(dolist (f (frame-list))
+		(unless (frame-parameter f 'frame-buffer-group-group)
+			(fbg/set-frame-group f "*")))
+	(let ((n 0)
+				names)
+		(dolist (b (fbg/builtin-buffer-list)) 
+			(with-current-buffer b
+				(setq names (append names frame-buffer-group-groups))
+				;; place buffer in unnamed
+				(when (and (fbg/buffer-managed-p b) (not frame-buffer-group-groups))
+					(setq n (1+ n))
+					(fbg/add-buffer-to-group "*"))))
+		(setq fbg/all-groups (or (seq-uniq names) '("*")))
+		(message "restored groups:%s; added %d buffers to unnamed" names n))
+	(fbg/ensure-buffers-visible))
+
+(defun fbg/ensure-buffers-visible (&optional frame)
+	;; ensure invariants:
+	;; - a buffer in this frame must be in the group this frame is bound to
+	;; - all frames that are bound to the same group must show all buffers in the group
+	;;
+	;; this frame ->
+	;; group ->
+	;; all frames bound to this group ->
+	;; all buffers (if a buffer has no group, set group) except "*" and " " ->
+	;; ensure buffers are in all frames
+	(let* ((group (fbg/group frame))
+				 (frames (fbg/frames-of-group group))
+				 (buf-in-group-p (lambda (b)
+													 (with-current-buffer b
+														 (member group frame-buffer-group-groups))))
+				 all-bufs)
+		;; collect all buffers in frames
+		(dolist (f frames)
+			(setq all-bufs (append all-bufs
+														 (seq-filter 'fbg/buffer-managed-p (frame-parameter f 'buffer-list)))))
+		;; collect all buffers in group
+		(setq all-bufs (append all-bufs
+													 (seq-filter buf-in-group-p (fbg/builtin-buffer-list))))
+		(setq all-bufs (seq-uniq all-bufs))
+		;; ensure buffers are in group 
+		(dolist (b all-bufs)
+			(with-current-buffer b
+				(fbg/add-buffer-to-group group)))
+		;; ensure buffers in all frames
+		(dolist (f frames)
+			(fbg/add-buffers-to-frame f all-bufs))))
+
+(defun fbg/add-buffers-to-frame (frame bufs)
+	(let* ((old (frame-parameter frame 'buffer-list))
+				 (combined (seq-uniq (append old bufs))))
+		(unless (eq (length old) (length combined))
+			(set-frame-parameter frame 'buffer-list combined))))
+
+(setq fbg/stick-buffers
+			(list
+			 (get-buffer "*scratch*")
+			 (get-buffer "*Messages*")))
+
+(defun fbg/after-make-frame (frame)
+	;; switch to *scratch* to hide the current buffer
+	;; bind frame to unname group
+	(fbg/set-frame-group frame "*")
+	(fbg/switch-to-scratch frame)
+	(fbg/bind-to frame "*")
+	(fbg/add-buffers-to-frame frame fbg/stick-buffers))
+
+(defun fbg/set-frame-group (frame group)
+	(and (fbg/empty-string-p group) (error "empty group"))
+	(set-frame-parameter frame 'frame-buffer-group-group group)
+	(let ((title (frame-parameter frame 'title))
+				(new-title (if (equal "*" group) nil (concat "⋅" group "⋅"))))
+		(when (or (not title) (string-prefix-p "⋅" title))
+			(set-frame-parameter frame 'title new-title))))
+
+(defun fbg/group (&optional frame)
+	(let ((group (frame-parameter frame 'frame-buffer-group-group)))
+		(or group (error "frame has no group"))
+		group))	
+
+(defun fbg/switch-to-scratch (frame &optional pred)
+	(dolist (w (window-list frame))
+		(with-selected-window w
+			(when (or (not pred) (funcall pred w))
+				(switch-to-buffer "*scratch*")))))
+
+(defun fbg/bind-to (frame group)
+	(let ((old (fbg/group frame)))
+		(and (fbg/empty-string-p old) (error "empty old group"))
+		(unless (equal "*" old)
+			(fbg/switch-to-scratch frame))
+		(set-frame-parameter frame 'buffer-list nil)
+		(fbg/set-frame-group frame group)
+		(unless (member group fbg/all-groups)
+			(setq fbg/all-groups (cons group fbg/all-groups))))
+	(fbg/ensure-buffers-visible))
+
+(defun fbg/frames-of-group (group)
+	(or (member group fbg/all-groups) (error "unknown group:%s" group))
+	(seq-filter
+	 (lambda (f) (equal group (fbg/group f)))
+	 (frame-list)))
+
+(defun fbg/empty-string-p (s)
+	(or (not s) (eq 0 (length s))))
+
+(defun fbg/add-buffer-to-group (group)
+	(let ((lst frame-buffer-group-groups))
+		(unless (member group lst)
+			(setq frame-buffer-group-groups (cons group lst)))))
+
+(defun fbg/remove-buffer-from-group (group)
+	(or (member group frame-buffer-group-groups) (error "buffer not in group:%s" group))
+	(setq frame-buffer-group-groups (delete group frame-buffer-group-groups)))
+
+(setq fbg/major-mode-whitelist
+			'(Buffer-menu-mode))
+
+(defun fbg/buffer-list (&optional frame)
+	(if (memq major-mode fbg/major-mode-whitelist) 
+			(fbg/builtin-buffer-list frame)
+		(frame-parameter frame 'buffer-list)))
+
+(defun fbg/call-interactively-with-builtin-buffer-list (cmd)
+	(cl-letf (((symbol-function 'buffer-list)
+						 #'fbg/builtin-buffer-list))
+		(call-interactively cmd)))
+
+(defun fbg/apply-with-builtin-buffer-list (func &rest args)
+	(cl-letf (((symbol-function 'buffer-list)
+						 #'fbg/builtin-buffer-list))
+		(apply func args)))
+
+;; use builtin buffer-list for some functions
+(setq fbg/builtin-function-whitelist
+			'(desktop-save))
 
 (provide 'frame-buffer-group)
 ;;; frame-buffer-group.el ends here
