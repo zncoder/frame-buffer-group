@@ -22,11 +22,15 @@
 ;;; Commentary:
 
 ;; FrameBufferGroup provides a straightforward way to organize buffers
-;; around frames. Buffers are placed in groups, and a frame can be
-;; bound to a group. The buffers in a group are visible (shown in
-;; switch-to-buffer) in this frame, but are not visible in another
-;; frame that are not bound to the group. The relationship between
-;; buffer, group, and frame is,
+;; around frames. Buffers that are opened in a frame are visible only
+;; in this frame.  These buffers form a group. We say the frame is
+;; bound to the group. When a frame is bound to a group, all buffers
+;; in the group are visible in the frame. As we open new buffers in
+;; the frame, the buffers are added to the group and are visible in
+;; the frame.  Buffers in the group are not visible in frames that are
+;; not bound to the group.  We can bind multiple frames to the same
+;; group, and make the buffers in the group visible in all these
+;; frames.  The relationship between buffer, group, and frame is,
 ;; - a buffer can be in N groups
 ;; - a group can have N buffers
 ;; - a frame is bound to 1 group
@@ -40,13 +44,22 @@
 ;; - F3 -> G1
 ;; In this example, buffer B1, B2 and B3 are visible in frame F1 and F3, and B1 is visible in F2.
 ;;
-;; The default group is the unnamed group, "*", which every newly created
-;; frame is bound to. The command frame-buffer-group-bind-group binds
-;; the frame to a group, a named one or the unnamed one. If the group
-;; does not exist, it is created. If the current group is the unnamed
-;; group, the buffers that are visible when the command is called are
-;; placed in the group. After a frame is bound to a group, all buffers
-;; in the group are visible in the frame.
+;; The default group is the unnamed group, "*", which every newly
+;; created frame is bound to. If we don't create a new group, the
+;; behavior is no different from the normal behavior. All buffers are
+;; visible in all frames. We bind the frame to a new group or an
+;; existing group with the command frame-buffer-group-bind-to. This
+;; command binds the selected frame to either a named one or the
+;; unnamed one. If the group does not exist, it is created. If the
+;; current group is the unnamed group, the buffers that are shown when
+;; the command is called are placed in the group, so that we can
+;; continue to work on these buffers in the new group.  But if the
+;; current group is a named one, the buffers that are shown are not
+;; placed in the new group.  To add a buffer that is in another group
+;; to this group, the one the selected frame is bound to, we use the
+;; command frame-buffer-group-builtin-switch-to-buffer, which makes
+;; all buffers available to switch to. Once a buffer is visible in the
+;; frame, it is added to the group the frame is bound to.
 ;;
 ;; A typical workflow is,
 ;; - create a new frame (this frame is bound to the unnamed group)
@@ -56,9 +69,10 @@
 ;; - need another frame to work on the same thing
 ;; - create a new frame
 ;; - bind the frame to the group foo
-;; - to work on something new, create a new frame
+;; - to work on something new, create a new frame, and bind it to
+;;   another group.
 ;;
-;; The buffer local variable frame-buffer-group-groups has all groups
+;; The buffer local variable frame-buffer-group-groups lists all groups
 ;; the buffer is in. It is added to desktop-locals-to-save to persist
 ;; the group info.
 
@@ -112,6 +126,8 @@ where they are opened."
 	(interactive
 	 (list (completing-read "Bind to group: " fbg/all-groups)))
 	(and (fbg/empty-string-p group) (setq group "*"))
+	(unless (member group fbg/all-groups)
+		(setq fbg/all-groups (cons group fbg/all-groups)))
 	(unless (equal (fbg/group) group)
 		(fbg/bind-to nil group)))
 
@@ -136,7 +152,8 @@ where they are opened."
 	(fset 'fbg/builtin-buffer-list (symbol-function 'buffer-list)))
 
 (setq fbg/enabled nil
-			fbg/all-groups nil)
+			fbg/all-groups nil
+			fbg/background-timer nil)
 
 (defun fbg/enable ()
 	(fbg/restore-groups)
@@ -151,9 +168,12 @@ where they are opened."
 	;; focus or the frame where the buffer is opened is deleted.
 	(add-hook 'focus-in-hook 'fbg/ensure-buffers-visible)
 	(add-hook 'delete-frame-functions 'fbg/ensure-buffers-visible)
-	(customize-push-and-save 'desktop-locals-to-save '(frame-buffer-group-groups)))
+	(customize-push-and-save 'desktop-locals-to-save '(frame-buffer-group-groups))
+	(setq fbg/background-timer
+		(run-at-time 61 61 'fbg/restore-groups)))
 
 (defun fbg/disable ()
+	(cancel-timer fbg/background-timer)
 	;; keep frame-buffer-group-groups in desktop-locals-to-save
 	(remove-hook 'delete-frame-functions 'fbg/ensure-buffers-visible)
 	(remove-hook 'focus-in-hook 'fbg/ensure-buffers-visible)
@@ -168,20 +188,18 @@ where they are opened."
 		(and (not (string-prefix-p "*" name)) (not (string-prefix-p " " name)))))
 
 (defun fbg/restore-groups ()
+	;; put frames without group to *
 	(dolist (f (frame-list))
 		(unless (frame-parameter f 'frame-buffer-group-group)
 			(fbg/set-frame-group f "*")))
-	(let ((n 0)
-				names)
+	(let (names)
 		(dolist (b (fbg/builtin-buffer-list)) 
 			(with-current-buffer b
 				(setq names (append names frame-buffer-group-groups))
 				;; place buffer in unnamed
 				(when (and (fbg/buffer-managed-p b) (not frame-buffer-group-groups))
-					(setq n (1+ n))
 					(fbg/add-buffer-to-group "*"))))
-		(setq fbg/all-groups (or (seq-uniq names) '("*")))
-		(message "restored groups:%s; added %d buffers to unnamed" names n))
+		(setq fbg/all-groups (or (seq-uniq names) '("*"))))
 	(fbg/ensure-buffers-visible))
 
 (defun fbg/ensure-buffers-visible (&optional frame)
@@ -260,9 +278,7 @@ where they are opened."
 		(unless (equal "*" old)
 			(fbg/switch-to-scratch frame))
 		(set-frame-parameter frame 'buffer-list nil)
-		(fbg/set-frame-group frame group)
-		(unless (member group fbg/all-groups)
-			(setq fbg/all-groups (cons group fbg/all-groups))))
+		(fbg/set-frame-group frame group))
 	(fbg/ensure-buffers-visible))
 
 (defun fbg/frames-of-group (group)
