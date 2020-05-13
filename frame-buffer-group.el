@@ -120,11 +120,14 @@ where they are opened."
   (interactive
    (let ((other-groups (remove (fbg/group) fbg/all-groups)))
      (list (completing-read "Bind to group: " other-groups nil nil (car other-groups)))))
-  (and (fbg/empty-string-p group) (setq group "*"))
-  (and (equal group (fbg/group)) (error "same group"))
-  (or (member group fbg/all-groups)
-      (setq fbg/all-groups (cons group fbg/all-groups)))
-  (fbg/bind-to nil group))
+	(let ((old-group (fbg/group)))
+		(and (fbg/empty-string-p group) (setq group "*"))
+		(and (equal group old-group) (error "same group"))
+		(or (member group fbg/all-groups)
+				(setq fbg/all-groups (cons group fbg/all-groups)))
+		(fbg/save-window-config old-group)
+		(fbg/bind-to nil group)
+		(fbg/restore-window-config group)))
 
 (defun frame-buffer-group-remove-current-buffer ()
   "Move current buffer from this group to the unnamed group."
@@ -292,14 +295,25 @@ where they are opened."
       (when (or (not pred) (funcall pred w))
         (switch-to-buffer "*scratch*")))))
 
-;; todo remember group window configuration in frame-parameter
-
 (defun fbg/bind-to (frame group)
   (fbg/fix-buffers-in-frame)
   (fbg/switch-to-scratch frame)
   (set-frame-parameter frame 'buffer-list nil)
   (fbg/set-frame-group frame group)
   (fbg/fix-buffers-in-group group))
+
+(defun fbg/save-window-config (group)
+	(let ((win-configs (frame-parameter nil 'fbg/window-configs)))
+		(setq win-configs (cons (cons group (current-window-configuration)) win-configs))
+		(set-frame-parameter nil 'fbg/window-configs win-configs)))
+
+(defun fbg/restore-window-config (group)
+	(let* ((win-configs (frame-parameter nil 'fbg/window-configs))
+				 (entry (assoc group win-configs)))
+		(when entry
+			(set-window-configuration (cdr entry))
+			(setq win-configs (assoc-delete-all group win-configs))
+			(set-frame-parameter nil 'fbg/window-configs win-configs))))
 
 (defun fbg/frames-of-group (group)
   (or (member group fbg/all-groups) (error "unknown group:%s" group))
